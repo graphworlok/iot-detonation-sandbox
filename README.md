@@ -189,3 +189,33 @@ line, in `/etc/sbx/inaccessible`; `sbx-run` hides them from every guest's
 QEMU process. For the sink, add a systemd drop-in, e.g.
 `/etc/systemd/system/sbx-sink.service.d/local.conf` with
 `[Service]` / `InaccessiblePaths=-/path`.
+
+## Built on
+
+This repository is a thin layer of scripts and configuration. The real work
+is done by these projects; none of them is redistributed here (packages come
+from the distribution, guest images are downloaded from OpenWrt at build
+time), and each keeps its own licence:
+
+| project | used for | licence |
+|---|---|---|
+| [QEMU](https://www.qemu.org/) | full-system emulation and KVM guests for every target | GPL-2.0 |
+| [Linux](https://kernel.org/) / KVM, bridge, netns, nftables | isolation, bridge port isolation, DNAT, namespaces | GPL-2.0 |
+| [OpenWrt](https://openwrt.org/) | guest kernels and root filesystems | GPL-2.0 (and component licences) |
+| [BusyBox](https://busybox.net/) | guest userland, including the copy the monitor runs from | GPL-2.0 |
+| [nftables](https://netfilter.org/projects/nftables/) | host guard and sink DNAT rules | GPL-2.0 |
+| [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) | DHCP on the sandbox network | GPL-2.0 / GPL-3.0 |
+| [tcpdump / libpcap](https://www.tcpdump.org/) | per-run packet capture | BSD-3-Clause |
+| [systemd](https://systemd.io/) | service sandboxing, transient units for each guest | LGPL-2.1-or-later |
+| [iproute2](https://wiki.linuxfoundation.org/networking/iproute2) | bridge, tap, veth and namespace setup | GPL-2.0 |
+| [e2fsprogs](https://e2fsprogs.sourceforge.net/) (`debugfs`, `resize2fs`) | customising guest images without mounting them | GPL-2.0 |
+| [OpenSSL](https://www.openssl.org/) | the sink's TLS certificate and termination | Apache-2.0 |
+| [Python](https://www.python.org/) | the sink, image builder and run controller (stdlib only) | PSF-2.0 |
+| [Ubuntu](https://ubuntu.com/) | host OS and packaging | various |
+
+Thanks to everyone who builds and maintains them.
+
+## Licence
+
+The scripts and configuration in this repository are under the
+[MIT licence](LICENSE).
