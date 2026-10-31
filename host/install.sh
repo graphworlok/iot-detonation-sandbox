@@ -50,6 +50,7 @@ chmod 0640 /etc/sbx/sink.key
 
 # data: samples to serve (read-only to the sink), images, runs, sink state
 install -d -m 0755 /srv/sandbox /srv/sandbox/serve /srv/sandbox/images /srv/sandbox/runs
+install -d -m 0711 /srv/sandbox/tmp
 install -d -m 0750 -o sbxsink -g sbxsink /var/lib/sbx /var/lib/sbx/sink
 
 install -m 0644 "$SRC"/host/systemd/sbx-*.service /etc/systemd/system/

@@ -37,6 +37,9 @@ SBX = "/opt/sbx"
 SERVE = "/srv/sandbox/serve"
 IMAGES = "/srv/sandbox/images"
 RUNS = "/srv/sandbox/runs"
+# per-run scratch shared with QEMU (sockets, trace, memory dumps): on disk,
+# because a dump is as large as guest RAM and /run is a small tmpfs
+SCRATCH = "/srv/sandbox/tmp"
 SINK_EVENTS = "/var/lib/sbx/sink/events.jsonl"
 LEASES = "/run/sbx-dnsmasq/leases"
 PROMPT = re.compile(rb"root@[^:]*:[^#]*# $")
@@ -127,6 +130,10 @@ def memdump(rtmp, t, mem_mb, label):
     for the target, otherwise a raw image of guest RAM (pmemsave)."""
     mon = f"{rtmp}/monitor.sock"
     elf = f"{rtmp}/mem-{label}.elf"
+    st = os.statvfs(rtmp)
+    need = (int(mem_mb) << 20) * 2 + (1 << 30)   # dump + its .gz + headroom
+    if st.f_bavail * st.f_frsize < need:
+        return {"label": label, "error": f"skipped: less than {need >> 20} MB free in {rtmp}"}
     # paths are quoted: HMP parses unquoted arguments as expressions, and the
     # '/' in a path reads as division
     out = hmp(mon, f'dump-guest-memory "{elf}"')
@@ -215,7 +222,7 @@ def main():
     tag = re.sub(r"[^A-Za-z0-9_.-]", "_", (a.sample or "cmd").replace("/", "_"))[:40]
     run_id = f"{stamp}-{a.target}-{tag}"
     rdir = f"{RUNS}/{run_id}"
-    rtmp = f"/run/sbx/{run_id}"
+    rtmp = f"{SCRATCH}/{run_id}"
     os.makedirs(rdir)
     os.makedirs(rtmp)
     sh("chown", "sbx:sbx", rtmp)
@@ -258,7 +265,9 @@ def main():
                  f"ReadWritePaths={rtmp}", f"ReadOnlyPaths={img}",
                  "InaccessiblePaths=" + " ".join("-" + p for p in inaccessible()),
                  "DevicePolicy=closed", "DeviceAllow=/dev/net/tun rw",
-                 f"RuntimeMaxSec={a.duration + 600}", "MemoryMax=1G", "TasksMax=64"]
+                 f"RuntimeMaxSec={a.duration + 600}",
+                 # guest RAM plus QEMU's own overhead
+                 f"MemoryMax={int(a.mem) + 512}M", "TasksMax=64"]
         if t.get("kvm"):
             props += ["DeviceAllow=/dev/kvm rw", "SupplementaryGroups=kvm"]
         sh("systemd-run", "--quiet", "--collect", f"--unit={unit}",

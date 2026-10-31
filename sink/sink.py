@@ -14,6 +14,8 @@ Runs inside the sbxsink namespace (sbx-sink.service), stdlib only.
 - DNS on :53 (every UDP query, to any server, is DNATed here): A queries get
   10.200.0.1 or a per-name address from rules.json "dns"; AAAA and other
   types get an empty NOERROR (musl fails a lookup whose AAAA is refused).
+  DNS framed over TCP (any port, also inside TLS, so DNS over TLS on :853)
+  is recognised by the catch-all and answered the same way.
 - UDP logger on :9998 (summarised per source, flood-safe). The original UDP
   destination is not recoverable after DNAT; the host-side pcap has it.
 - GET /_sbx/<path> to the sink address serves files from SERVE_DIR: this is
@@ -249,6 +251,9 @@ class TCPHandler(socketserver.BaseRequestHandler):
                            "head": head[:4096], "body_len": len(body),
                            "body_sha256": keep_blob(body), "rule": rule,
                            "resp_len": len(resp)})
+            elif looks_like_dns_tcp(first):
+                ev["kind"] = "dns"
+                ev["queries"] = self.dns_tcp(conn, first, src, f"{dst}:{port}", ev.get("tls"))
             else:
                 r, _ = match_rule("raw", dst, port)
                 resp = (r or {}).get("respond") or rules().get("default_raw") or {}
@@ -279,6 +284,29 @@ class TCPHandler(socketserver.BaseRequestHandler):
                 conn.close()
             except OSError:
                 pass
+
+    @staticmethod
+    def dns_tcp(conn, buf, src, dst, tls):
+        """Answer length-framed DNS queries (plain TCP or, after the TLS
+        unwrap above, DNS over TLS) until the client stops sending."""
+        n = 0
+        while True:
+            while len(buf) >= 2 and len(buf) >= 2 + struct.unpack("!H", buf[:2])[0]:
+                ln = struct.unpack("!H", buf[:2])[0]
+                q, buf = buf[2:2 + ln], buf[2 + ln:]
+                r = dns_reply(q)
+                if not r:
+                    return n
+                conn.sendall(struct.pack("!H", len(r[0])) + r[0])
+                log({"proto": "dns", "transport": "tls" if tls else "tcp",
+                     "src": src, "dst": dst, **r[1]})
+                n += 1
+            if len(buf) > 65537:
+                return n
+            more = recv_some(conn, 65536, 10)
+            if not more:
+                return n
+            buf += more
 
 
 class _Replay:
@@ -338,51 +366,72 @@ class UDPLogger(threading.Thread):
                 self.stats, last = {}, time.time()
 
 
-class DNSServer(threading.Thread):
-    """Wildcard resolver: A -> rules.json dns override or the sink address."""
-
-    QTYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX",
+DNS_QTYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX",
               16: "TXT", 28: "AAAA", 33: "SRV", 255: "ANY"}
+
+
+def dns_answer_for(name):
+    dns = rules().get("dns", {})
+    for pattern, ip in dns.get("names", {}).items():
+        if re.fullmatch(pattern, name, re.I):
+            return ip
+    return dns.get("default", SINK_IP)
+
+
+def dns_reply(q):
+    """Answer one DNS query message: (reply, log fields), or None if `q` is
+    not a single-question query. A -> dns_answer_for(); anything else gets an
+    empty NOERROR."""
+    if len(q) < 17:
+        return None
+    qid, flags, qd = struct.unpack("!HHH", q[:6])
+    if flags & 0xF800 or qd != 1:      # a response, or not a standard query
+        return None
+    i, labels = 12, []
+    while i < len(q) and q[i]:
+        labels.append(q[i + 1:i + 1 + q[i]].decode("ascii", "replace"))
+        i += 1 + q[i]
+    if i + 5 > len(q):
+        return None
+    qtype, qclass = struct.unpack("!HH", q[i + 1:i + 5])
+    question = q[12:i + 5]
+    name = ".".join(labels)
+    ans = b""
+    ip = None
+    if qtype == 1 and qclass == 1:
+        ip = dns_answer_for(name)
+        ans = struct.pack("!HHHIH", 0xC00C, 1, 1, 60, 4) + socket.inet_aton(ip)
+    rflags = 0x8180 | (flags & 0x0100)
+    hdr = struct.pack("!HHHHHH", qid, rflags, 1, 1 if ans else 0, 0, 0)
+    return hdr + question + ans, {"qname": name, "qtype": DNS_QTYPES.get(qtype, qtype),
+                                  "answer": ip}
+
+
+def looks_like_dns_tcp(data):
+    """DNS over TCP framing (RFC 1035 4.2.2): 2-byte length, then a query."""
+    if len(data) < 19:
+        return False
+    n = struct.unpack("!H", data[:2])[0]
+    return 17 <= n <= len(data) - 2 and dns_reply(data[2:2 + n]) is not None
+
+
+class DNSServer(threading.Thread):
+    """Wildcard resolver on UDP :53, see dns_reply()."""
 
     def __init__(self):
         super().__init__(daemon=True)
         self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.s.bind((SINK_IP, 53))
 
-    @staticmethod
-    def answer_for(name):
-        dns = rules().get("dns", {})
-        for pattern, ip in dns.get("names", {}).items():
-            if re.fullmatch(pattern, name, re.I):
-                return ip
-        return dns.get("default", SINK_IP)
-
     def run(self):
         while True:
             try:
                 q, a = self.s.recvfrom(4096)
-                if len(q) < 17:
+                r = dns_reply(q)
+                if not r:
                     continue
-                qid, flags, qd = struct.unpack("!HHH", q[:6])
-                if flags & 0x8000 or qd != 1:
-                    continue
-                i, labels = 12, []
-                while i < len(q) and q[i]:
-                    labels.append(q[i + 1:i + 1 + q[i]].decode("ascii", "replace"))
-                    i += 1 + q[i]
-                qtype, qclass = struct.unpack("!HH", q[i + 1:i + 5])
-                question = q[12:i + 5]
-                name = ".".join(labels)
-                ans = b""
-                ip = None
-                if qtype == 1 and qclass == 1:
-                    ip = self.answer_for(name)
-                    ans = struct.pack("!HHHIH", 0xC00C, 1, 1, 60, 4) + socket.inet_aton(ip)
-                rflags = 0x8180 | (flags & 0x0100)
-                hdr = struct.pack("!HHHHHH", qid, rflags, 1, 1 if ans else 0, 0, 0)
-                self.s.sendto(hdr + question + ans, a)
-                log({"proto": "dns", "src": "%s:%d" % a, "qname": name,
-                     "qtype": self.QTYPES.get(qtype, qtype), "answer": ip})
+                self.s.sendto(r[0], a)
+                log({"proto": "dns", "src": "%s:%d" % a, **r[1]})
             except Exception as e:
                 sys.stderr.write(f"dns: {e!r}\n")
 

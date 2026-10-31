@@ -1,7 +1,7 @@
 """Syscall tracer that runs outside the guest, through QEMU's gdb stub.
 
 Loaded by sbx-run as:
-    gdb-multiarch -nx -batch -ex "python SBX_CFG='/run/sbx/<id>/trace.json'" -x sbx-trace.py
+    gdb-multiarch -nx -batch -ex "python SBX_CFG='/srv/sandbox/tmp/<id>/trace.json'" -x sbx-trace.py
 
 Nothing runs inside the guest: breakpoints are QEMU (TCG) breakpoints, so a
 sample cannot see or kill the tracer. Kernel symbols are not needed (OpenWrt

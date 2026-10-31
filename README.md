@@ -43,6 +43,8 @@ MACs or 10.200.0.0/24), see [Verification](#verification).
 - **DNS:** every name resolves to 10.200.0.1, whichever server the sample
   asks (queries to 8.8.8.8 are DNATed too). AAAA and other types get an
   empty NOERROR (musl fails a whole lookup if AAAA is REFUSED).
+  DNS over TCP is answered on any port, and DNS over TLS too (a sample with
+  its own resolver list may use :853).
   `rules.json` `dns.names` can map a name to another address, e.g. to make a
   domain look like a known C2 IP so IP-based rules match.
 - **TCP:** the original destination is recovered with `SO_ORIGINAL_DST`.
