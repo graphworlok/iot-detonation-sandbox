@@ -103,6 +103,57 @@ def inaccessible():
     return paths
 
 
+def hmp(path, cmd, timeout=300):
+    """Run one QEMU human-monitor command over its unix socket; return its output."""
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(timeout)
+    s.connect(path)
+    buf = b""
+    while not buf.endswith(b"(qemu) "):
+        buf += s.recv(65536)
+    s.sendall(cmd.encode() + b"\n")
+    buf = b""
+    while buf.count(b"(qemu) ") < 1:
+        d = s.recv(65536)
+        if not d:
+            break
+        buf += d
+    s.close()
+    return re.sub(rb"\x1b\[[0-9;]*[A-Za-z]", b"", buf).decode("latin-1", "replace")
+
+
+def memdump(rtmp, t, mem_mb, label):
+    """Guest memory to {rtmp}/mem-<label>.*: an ELF core where QEMU supports it
+    for the target, otherwise a raw image of guest RAM (pmemsave)."""
+    mon = f"{rtmp}/monitor.sock"
+    elf = f"{rtmp}/mem-{label}.elf"
+    # paths are quoted: HMP parses unquoted arguments as expressions, and the
+    # '/' in a path reads as division
+    out = hmp(mon, f'dump-guest-memory "{elf}"')
+    if os.path.exists(elf) and os.path.getsize(elf) > 0:
+        return {"label": label, "file": os.path.basename(elf), "format": "elf"}
+    raw = f"{rtmp}/mem-{label}.raw"
+    size = int(mem_mb) << 20
+    out2 = hmp(mon, f'pmemsave {t.get("ram_base", "0x0")} {size} "{raw}"')
+    if os.path.exists(raw) and os.path.getsize(raw) > 0:
+        return {"label": label, "file": os.path.basename(raw), "format": "raw",
+                "phys_base": t.get("ram_base", "0x0"), "elf_error": out.strip()[-200:]}
+    return {"label": label, "error": (out + out2).strip()[-300:]}
+
+
+def wait_status(path, prefixes, timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            for l in open(path):
+                if l.startswith(prefixes):
+                    return l.strip()
+        except OSError:
+            pass
+        time.sleep(0.5)
+    return None
+
+
 def lease_ip(mac, timeout):
     end = time.time() + timeout
     while time.time() < end:
@@ -131,7 +182,15 @@ def main():
                     "ls -la /tmp /dev/shm; cat /dev/shm/.comm",
                     help="guest commands run at the end if the console shell survived "
                          "(avoid ps/top/netstat/ss/lsof: some samples kill them)")
+    ap.add_argument("--no-trace", action="store_true",
+                    help="do not attach the out-of-guest syscall tracer (sbx-trace.py)")
+    ap.add_argument("--trace-open", action="store_true",
+                    help="also trace open/openat (very noisy; slows the guest)")
+    ap.add_argument("--memdump", default="end",
+                    help="when to dump guest memory: comma-separated seconds after "
+                         "detonation and/or 'end' (default: end); 'none' to disable")
     a = ap.parse_args()
+    dumps = [] if a.memdump == "none" else [x.strip() for x in a.memdump.split(",") if x.strip()]
     if os.geteuid() != 0:
         sys.exit("run as root (needs tap + capture)")
     if not a.sample and not a.cmd:
@@ -169,7 +228,9 @@ def main():
             "duration": a.duration, "mac": mac, "tap": tap, "unit": unit,
             "image": json.load(open(f"{img}/manifest.json"))}
 
-    cap = None
+    trace = t.get("trace") and not a.no_trace
+    gdb_port = 20000 + n % 20000
+    cap = gdbp = None
     try:
         sh("ip", "tuntap", "add", "dev", tap, "mode", "tap", "user", "sbx")
         sh("sysctl", "-q", "-w", f"net.ipv6.conf.{tap}.disable_ipv6=1")
@@ -190,6 +251,8 @@ def main():
                  "-chardev", f"socket,id=s0,path={rtmp}/console.sock,server=on,wait=off",
                  "-serial", "chardev:s0",
                  "-monitor", f"unix:{rtmp}/monitor.sock,server=on,wait=off"]
+        if trace:
+            argv += ["-gdb", f"tcp:127.0.0.1:{gdb_port}"]
         props = ["User=sbx", "Group=sbx", "NoNewPrivileges=yes",
                  "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes",
                  f"ReadWritePaths={rtmp}", f"ReadOnlyPaths={img}",
@@ -220,6 +283,9 @@ def main():
             raise SystemExit("guest got no DHCP lease from the sink")
         meta["boot_done"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+        if trace:
+            gdbp = start_tracer(con, t, img, rtmp, gdb_port, a.trace_open, meta)
+
         if not a.no_monitor:
             con.run("/usr/libexec/sbx/sh /usr/libexec/sbx/mon.sh </dev/null >/dev/console 2>&1 &")
         if a.cmd:
@@ -228,13 +294,20 @@ def main():
             con.run(f"cd /tmp && wget -q -O .b http://10.200.0.1/_sbx/{a.sample} && chmod 777 .b", 60)
             con.send(f"./.b {a.args}".rstrip())
         meta["detonated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        end = time.time() + a.duration
+        t0 = time.time()
+        end = t0 + a.duration
+        timed = sorted(int(x) for x in dumps if x.isdigit())
+        meta["memdumps"] = []
         while time.time() < end:
+            if timed and time.time() - t0 >= timed[0]:
+                meta["memdumps"].append(memdump(rtmp, t, a.mem, f"t{timed.pop(0)}"))
             try:
-                con.pump(min(5, end - time.time()))
+                con.pump(min(1 if timed else 5, end - time.time()))
             except EOFError:
                 meta["guest_exited_early"] = True
                 break
+        if "end" in dumps and not meta.get("guest_exited_early"):
+            meta["memdumps"].append(memdump(rtmp, t, a.mem, "end"))
         if not meta.get("guest_exited_early") and a.post:
             # stop the monitor (its output never lets a prompt be the last
             # thing on the console), then run the post commands. The markers
@@ -251,11 +324,58 @@ def main():
             cap.terminate()
             cap.wait(10)
         sh("ip", "link", "del", tap, check=False, stderr=subprocess.DEVNULL)
+        if gdbp:
+            try:
+                gdbp.wait(15)   # exits when QEMU closes the gdb connection
+            except subprocess.TimeoutExpired:
+                gdbp.kill()
+        for fn in ("trace.jsonl", "trace.status", "gdb.log"):
+            if os.path.exists(f"{rtmp}/{fn}"):
+                sh("cp", f"{rtmp}/{fn}", rdir, check=False)
+        for d in meta.get("memdumps", []):
+            if d.get("file") and os.path.exists(f"{rtmp}/{d['file']}"):
+                sh("gzip", "-1", f"{rtmp}/{d['file']}", check=False)
+                sh("mv", f"{rtmp}/{d['file']}.gz", rdir, check=False)
+                d["file"] += ".gz"
         collect(meta, rdir)
         with open(f"{rdir}/run.json", "w") as f:
             json.dump(meta, f, indent=1)
         sh("rm", "-rf", rtmp, check=False)
         print(rdir)
+
+
+def start_tracer(con, t, img, rtmp, port, trace_open, meta):
+    """Attach sbx-trace.py through QEMU's gdb stub and calibrate it.
+
+    The console shell's PID is the calibration anchor: the tracer waits for
+    that shell to call kill(own pid, 0). Failure is recorded, not fatal: the
+    run continues untraced."""
+    con.send("echo SBXPID=$((0+$$))")
+    if not con.wait(rb"SBXPID=(\d+)\r?\n", 20):
+        meta["trace"] = {"error": "no shell pid"}
+        return None
+    shell_pid = int(re.search(rb"SBXPID=(\d+)\r?\n", con.buf).group(1))
+    con.wait(PROMPT, 10)
+    cfg = {"port": port, "kernel": f"{img}/kernel", "endian": t.get("endian", "little"),
+           "shell_pid": shell_pid, "trace_open": trace_open,
+           "out": f"{rtmp}/trace.jsonl", "status": f"{rtmp}/trace.status"}
+    with open(f"{rtmp}/trace.json", "w") as f:
+        json.dump(cfg, f)
+    for fn in ("trace.jsonl", "trace.status"):
+        open(f"{rtmp}/{fn}", "a").close()
+        sh("chown", "sbx:sbx", f"{rtmp}/{fn}")
+    gdbp = subprocess.Popen(
+        ["runuser", "-u", "sbx", "--", "gdb-multiarch", "-nx", "-batch",
+         "-ex", f"python SBX_CFG='{rtmp}/trace.json'", "-x", f"{SBX}/run/sbx-trace.py"],
+        stdin=subprocess.DEVNULL, stdout=open(f"{rtmp}/gdb.log", "w"), stderr=subprocess.STDOUT)
+    st = wait_status(f"{rtmp}/trace.status", ("READY", "FAIL"), 120)
+    if not st or st.startswith("FAIL"):
+        meta["trace"] = {"error": st or "tracer not ready"}
+        return gdbp
+    con.run("kill -0 $$")
+    st = wait_status(f"{rtmp}/trace.status", ("TRACING", "FAIL"), 60)
+    meta["trace"] = {"status": st or "calibration timed out"}
+    return gdbp
 
 
 def collect(meta, rdir):

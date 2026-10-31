@@ -13,7 +13,8 @@ SRC=$(cd "$(dirname "$0")/.." && pwd)
 # accident.
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     qemu-system-x86 qemu-system-arm qemu-system-mips qemu-utils \
-    dnsmasq-base nftables tcpdump iproute2 e2fsprogs openssl python3
+    dnsmasq-base nftables tcpdump iproute2 e2fsprogs openssl python3 \
+    gdb-multiarch gzip
 if ls /proc/sys/fs/binfmt_misc 2>/dev/null | grep -q qemu; then
     echo "WARNING: qemu binfmt handlers are registered on this host" >&2
 fi
@@ -34,6 +35,7 @@ install -m 0644 "$SRC/guests/targets.json" /opt/sbx/guests/
 rm -rf /opt/sbx/guests/overlay
 cp -r "$SRC/guests/overlay" /opt/sbx/guests/overlay
 install -m 0755 "$SRC/run/sbx-run.py" /opt/sbx/run/
+install -m 0644 "$SRC/run/sbx-trace.py" /opt/sbx/run/
 ln -sf /opt/sbx/run/sbx-run.py /usr/local/sbin/sbx-run
 
 # config: rules.json is only seeded; local edits survive re-installs

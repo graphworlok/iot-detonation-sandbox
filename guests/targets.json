@@ -1,5 +1,5 @@
 {
-  "_comment": "Guest definitions. openwrt: release target dir and the two files used (kernel, gzipped ext4 rootfs). qemu: argv template; {kernel} {rootfs} {tap} {mac} {console} {monitor} {mem} are filled in by sbx-run. kvm: needs /dev/kvm. arches: which sample builds this guest runs.",
+  "_comment": "Guest definitions. openwrt: release target dir and the two files used (kernel, gzipped ext4 rootfs). qemu: argv template; {kernel} {rootfs} {tap} {mac} {console} {monitor} {mem} are filled in by sbx-run. kvm: needs /dev/kvm. arches: which sample builds this guest runs. ram_base: guest-physical start of RAM (for pmemsave dumps). trace: syscall tracer ABI (sbx-trace.py), endian: guest byte order.",
   "openwrt_release": "25.12.6",
   "targets": {
     "x86": {
@@ -8,12 +8,8 @@
       "rootfs": "openwrt-{rel}-x86-generic-generic-ext4-rootfs.img.gz",
       "kvm": true,
       "arches": ["x86", "i386", "i486", "i586", "i686"],
-      "qemu": ["qemu-system-i386", "-accel", "kvm", "-cpu", "host", "-m", "{mem}",
-               "-kernel", "{kernel}",
-               "-drive", "file={rootfs},if=virtio,format=raw,snapshot=on",
-               "-append", "root=/dev/vda rootfstype=ext4 rootwait console=ttyS0 panic=5",
-               "-netdev", "tap,id=n0,ifname={tap},script=no,downscript=no",
-               "-device", "virtio-net-pci,netdev=n0,mac={mac}"]
+      "qemu": ["qemu-system-i386", "-accel", "kvm", "-cpu", "host", "-m", "{mem}", "-kernel", "{kernel}", "-drive", "file={rootfs},if=virtio,format=raw,snapshot=on", "-append", "root=/dev/vda rootfstype=ext4 rootwait console=ttyS0 panic=5", "-netdev", "tap,id=n0,ifname={tap},script=no,downscript=no", "-device", "virtio-net-pci,netdev=n0,mac={mac}"],
+      "ram_base": "0x0"
     },
     "x86_64": {
       "openwrt": "x86/64",
@@ -21,12 +17,8 @@
       "rootfs": "openwrt-{rel}-x86-64-generic-ext4-rootfs.img.gz",
       "kvm": true,
       "arches": ["x86_64", "amd64"],
-      "qemu": ["qemu-system-x86_64", "-accel", "kvm", "-cpu", "host", "-m", "{mem}",
-               "-kernel", "{kernel}",
-               "-drive", "file={rootfs},if=virtio,format=raw,snapshot=on",
-               "-append", "root=/dev/vda rootfstype=ext4 rootwait console=ttyS0 panic=5",
-               "-netdev", "tap,id=n0,ifname={tap},script=no,downscript=no",
-               "-device", "virtio-net-pci,netdev=n0,mac={mac}"]
+      "qemu": ["qemu-system-x86_64", "-accel", "kvm", "-cpu", "host", "-m", "{mem}", "-kernel", "{kernel}", "-drive", "file={rootfs},if=virtio,format=raw,snapshot=on", "-append", "root=/dev/vda rootfstype=ext4 rootwait console=ttyS0 panic=5", "-netdev", "tap,id=n0,ifname={tap},script=no,downscript=no", "-device", "virtio-net-pci,netdev=n0,mac={mac}"],
+      "ram_base": "0x0"
     },
     "mips": {
       "openwrt": "malta/be",
@@ -34,12 +26,10 @@
       "rootfs": "openwrt-{rel}-malta-be-rootfs-ext4.img.gz",
       "kvm": false,
       "arches": ["mips"],
-      "qemu": ["qemu-system-mips", "-M", "malta", "-m", "{mem}",
-               "-kernel", "{kernel}",
-               "-drive", "file={rootfs},if=ide,format=raw,snapshot=on",
-               "-append", "root=/dev/sda rootfstype=ext4 rootwait console=ttyS0 panic=5",
-               "-netdev", "tap,id=n0,ifname={tap},script=no,downscript=no",
-               "-device", "pcnet,netdev=n0,mac={mac}"]
+      "qemu": ["qemu-system-mips", "-M", "malta", "-m", "{mem}", "-kernel", "{kernel}", "-drive", "file={rootfs},if=ide,format=raw,snapshot=on", "-append", "root=/dev/sda rootfstype=ext4 rootwait console=ttyS0 panic=5", "-netdev", "tap,id=n0,ifname={tap},script=no,downscript=no", "-device", "pcnet,netdev=n0,mac={mac}"],
+      "ram_base": "0x0",
+      "trace": "mips-o32",
+      "endian": "big"
     },
     "mipsel": {
       "openwrt": "malta/le",
@@ -47,12 +37,10 @@
       "rootfs": "openwrt-{rel}-malta-le-rootfs-ext4.img.gz",
       "kvm": false,
       "arches": ["mipsel", "mpsl", "mipsle"],
-      "qemu": ["qemu-system-mipsel", "-M", "malta", "-m", "{mem}",
-               "-kernel", "{kernel}",
-               "-drive", "file={rootfs},if=ide,format=raw,snapshot=on",
-               "-append", "root=/dev/sda rootfstype=ext4 rootwait console=ttyS0 panic=5",
-               "-netdev", "tap,id=n0,ifname={tap},script=no,downscript=no",
-               "-device", "pcnet,netdev=n0,mac={mac}"]
+      "qemu": ["qemu-system-mipsel", "-M", "malta", "-m", "{mem}", "-kernel", "{kernel}", "-drive", "file={rootfs},if=ide,format=raw,snapshot=on", "-append", "root=/dev/sda rootfstype=ext4 rootwait console=ttyS0 panic=5", "-netdev", "tap,id=n0,ifname={tap},script=no,downscript=no", "-device", "pcnet,netdev=n0,mac={mac}"],
+      "ram_base": "0x0",
+      "trace": "mips-o32",
+      "endian": "little"
     },
     "armv7": {
       "openwrt": "armsr/armv7",
@@ -60,13 +48,8 @@
       "rootfs": "openwrt-{rel}-armsr-armv7-generic-ext4-rootfs.img.gz",
       "kvm": false,
       "arches": ["armv6l", "armv7l", "arm6", "arm7"],
-      "qemu": ["qemu-system-arm", "-M", "virt", "-cpu", "cortex-a15", "-m", "{mem}",
-               "-kernel", "{kernel}",
-               "-drive", "if=none,file={rootfs},format=raw,id=hd0,snapshot=on",
-               "-device", "virtio-blk-pci,drive=hd0",
-               "-append", "root=/dev/vda rootfstype=ext4 rootwait console=ttyAMA0 panic=5",
-               "-netdev", "tap,id=n0,ifname={tap},script=no,downscript=no",
-               "-device", "virtio-net-pci,netdev=n0,mac={mac}"]
+      "qemu": ["qemu-system-arm", "-M", "virt", "-cpu", "cortex-a15", "-m", "{mem}", "-kernel", "{kernel}", "-drive", "if=none,file={rootfs},format=raw,id=hd0,snapshot=on", "-device", "virtio-blk-pci,drive=hd0", "-append", "root=/dev/vda rootfstype=ext4 rootwait console=ttyAMA0 panic=5", "-netdev", "tap,id=n0,ifname={tap},script=no,downscript=no", "-device", "virtio-net-pci,netdev=n0,mac={mac}"],
+      "ram_base": "0x40000000"
     },
     "aarch64": {
       "openwrt": "armsr/armv8",
@@ -74,13 +57,8 @@
       "rootfs": "openwrt-{rel}-armsr-armv8-generic-ext4-rootfs.img.gz",
       "kvm": false,
       "arches": ["aarch64", "arm64", "armv8l"],
-      "qemu": ["qemu-system-aarch64", "-M", "virt", "-cpu", "cortex-a53", "-m", "{mem}",
-               "-kernel", "{kernel}",
-               "-drive", "if=none,file={rootfs},format=raw,id=hd0,snapshot=on",
-               "-device", "virtio-blk-pci,drive=hd0",
-               "-append", "root=/dev/vda rootfstype=ext4 rootwait console=ttyAMA0 panic=5",
-               "-netdev", "tap,id=n0,ifname={tap},script=no,downscript=no",
-               "-device", "virtio-net-pci,netdev=n0,mac={mac}"]
+      "qemu": ["qemu-system-aarch64", "-M", "virt", "-cpu", "cortex-a53", "-m", "{mem}", "-kernel", "{kernel}", "-drive", "if=none,file={rootfs},format=raw,id=hd0,snapshot=on", "-device", "virtio-blk-pci,drive=hd0", "-append", "root=/dev/vda rootfstype=ext4 rootwait console=ttyAMA0 panic=5", "-netdev", "tap,id=n0,ifname={tap},script=no,downscript=no", "-device", "virtio-net-pci,netdev=n0,mac={mac}"],
+      "ram_base": "0x40000000"
     }
   }
 }

@@ -154,10 +154,48 @@ console shell survived (default: `dmesg | tail -60`, `/proc/net/tcp|udp`,
 | `capture.pcap00…` | everything to/from the guest MAC on `sbx0` (100 MB × 20 cap) |
 | `sink.jsonl` | the sink's events for this guest during the run |
 | `dhcp.log` | dnsmasq lines for this guest |
-| `run.json` | parameters, image manifest, MAC/IP, timings, sample SHA-256 |
+| `trace.jsonl`, `trace.status`, `gdb.log` | out-of-guest syscall trace (below) |
+| `mem-<label>.{elf,raw}.gz` | guest memory dumps (below) |
+| `run.json` | parameters, image manifest, MAC/IP, timings, sample SHA-256, tracer and dump status |
 
 Keep `--post` free of `ps`, `top`, `netstat`, `ss`, `lsof`, `strace`: some
 samples kill processes whose command line contains them.
+
+## Telemetry from the emulator
+
+Two sources sit outside the guest, so a sample can neither see nor kill
+them.
+
+**Syscall trace (`run/sbx-trace.py`, MIPS o32 guests: `mips`, `mipsel`).**
+QEMU's gdb stub is opened on `127.0.0.1` and `gdb-multiarch` puts
+breakpoints on the kernel's syscall handlers. Under TCG these are emulator
+breakpoints: nothing in guest memory changes. No kernel symbols are needed
+(OpenWrt kernels have no kallsyms):
+- the o32 syscall table is found in the kernel image by shape (about 460
+  pointers into `.text`, mostly distinct, with the unimplemented slots all
+  pointing at one stub);
+- the current task comes from the `thread_info` pointer the MIPS kernel
+  keeps in `$gp`;
+- the PID and name offsets inside `task_struct` are calibrated at start-up:
+  the console shell (known PID, name `ash`) calls `kill($$, 0)` and the
+  tracer searches that task for them.
+
+Traced by default: `execve` (path, argv), `fork`/`vfork`/`clone` (child PID),
+`exit`/`exit_group`, `kill` (target, signal), `socket`, `connect`/`bind`
+(decoded address, result), `listen`, `sendto`, `prctl` (incl. `PR_SET_NAME`),
+`unlink`/`unlinkat`, `rename`, `chdir`, `setsid`, `reboot`, `ptrace`.
+`--trace-open` adds `open`/`openat` (noisy, slows the guest). Each event has
+the PID, TGID and process name; results are logged on the return path.
+`--no-trace` turns it off. Other guest ABIs (ARM, x86) need their own
+syscall numbers, argument registers and current-task expression; not done
+yet.
+
+**Memory dumps (QEMU monitor).** `--memdump end` (default) dumps guest RAM
+before the post commands; `--memdump 30,90,end` adds dumps at those
+seconds after detonation; `--memdump none` disables. `dump-guest-memory`
+(ELF core) is used where QEMU supports it for the target; otherwise (MIPS)
+`pmemsave` writes raw guest-physical RAM from the target's `ram_base`. A
+256 MB guest compresses to roughly 15 MB.
 
 ## Verification
 
@@ -207,6 +245,7 @@ time), and each keeps its own licence:
 | [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) | DHCP on the sandbox network | GPL-2.0 / GPL-3.0 |
 | [tcpdump / libpcap](https://www.tcpdump.org/) | per-run packet capture | BSD-3-Clause |
 | [systemd](https://systemd.io/) | service sandboxing, transient units for each guest | LGPL-2.1-or-later |
+| [GDB](https://www.sourceware.org/gdb/) (`gdb-multiarch`) | out-of-guest syscall tracing through QEMU's gdb stub | GPL-3.0 |
 | [iproute2](https://wiki.linuxfoundation.org/networking/iproute2) | bridge, tap, veth and namespace setup | GPL-2.0 |
 | [e2fsprogs](https://e2fsprogs.sourceforge.net/) (`debugfs`, `resize2fs`) | customising guest images without mounting them | GPL-2.0 |
 | [OpenSSL](https://www.openssl.org/) | the sink's TLS certificate and termination | Apache-2.0 |
