@@ -1,4 +1,8 @@
-# Detonation sandbox
+# IoT detonation sandbox
+
+> **Handles live malware.** Use a dedicated host, keep the samples off any
+> machine you care about, and re-run the [verification](#verification)
+> after every change to the networking. No warranty.
 
 Runs collected IoT samples in disposable QEMU guests on an isolated network
 whose only other member is a **traffic sink** that pretends to be the
