@@ -1,0 +1,22 @@
+# Host-side guard for the sandbox bridge. Loaded by sbx-net.sh up.
+# The bridge has no host address, so this is belt and braces: anything that
+# reaches the host stack from an sbx* interface is dropped, and nothing is
+# forwarded between sbx* and any other interface.
+table inet sbx_host
+delete table inet sbx_host
+
+table inet sbx_host {
+    chain input {
+        type filter hook input priority -10; policy accept;
+        iifname "sbx*" counter drop
+    }
+    chain forward {
+        type filter hook forward priority -10; policy accept;
+        iifname "sbx*" counter drop
+        oifname "sbx*" counter drop
+    }
+    chain output {
+        type filter hook output priority -10; policy accept;
+        oifname "sbx*" counter drop
+    }
+}

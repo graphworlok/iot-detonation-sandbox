@@ -1,0 +1,31 @@
+# Rules inside the sbxsink namespace: make 10.200.0.1 look like "the
+# internet". Every TCP connection, to any address and port, is redirected to
+# the catch-all (sink.py, :9999), which recovers the original destination
+# with SO_ORIGINAL_DST. UDP DNS to any server goes to sink.py's resolver
+# (:53), which answers every name with 10.200.0.1 unless rules.json says
+# otherwise. Other UDP goes to sink.py's datagram logger (:9998). ICMP to any
+# address is answered by the sink itself, so every host "is up". DHCP (:67)
+# is dnsmasq.
+table ip sbx_sink
+delete table ip sbx_sink
+
+table ip sbx_sink {
+    chain pre {
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname != "eth0" return
+        udp dport 67 return
+        udp dport 53 dnat to 10.200.0.1:53
+        meta l4proto tcp dnat to 10.200.0.1:9999
+        meta l4proto udp dnat to 10.200.0.1:9998
+        ip daddr != 10.200.0.1 meta l4proto icmp dnat to 10.200.0.1
+    }
+    chain in {
+        type filter hook input priority filter; policy drop;
+        iifname "lo" accept
+        ct state established,related accept
+        udp dport { 53, 67, 9998 } accept
+        tcp dport 9999 accept
+        icmp type echo-request limit rate 50/second accept
+        counter drop
+    }
+}

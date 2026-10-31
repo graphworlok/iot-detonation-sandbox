@@ -1,0 +1,28 @@
+[Unit]
+Description=Sandbox traffic sink (fake internet, inside sbxsink)
+Requires=sbx-net.service
+After=sbx-net.service sbx-dnsmasq.service
+PartOf=sbx-net.service
+
+[Service]
+NetworkNamespacePath=/run/netns/sbxsink
+User=sbxsink
+Group=sbxsink
+ExecStart=/usr/bin/python3 -I /opt/sbx/sink/sink.py
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/sbx/sink
+ReadOnlyPaths=/srv/sandbox/serve /etc/sbx
+# only to bind DNS on :53 inside the namespace
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+RestrictAddressFamilies=AF_INET AF_UNIX
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

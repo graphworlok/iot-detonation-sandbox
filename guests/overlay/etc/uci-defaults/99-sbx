@@ -1,0 +1,21 @@
+#!/bin/sh
+# Sandbox guest config, applied at every boot (guests run with snapshot=on,
+# so the uci-defaults "already ran" marker never persists).
+# - LAN takes a DHCP lease from the sink (10.200.0.0/24, gateway + DNS = sink)
+# - no DHCP server, firewall, NTP, ssh or web UI inside the guest
+uci -q batch <<'EOF'
+set system.@system[0].hostname='router'
+set network.lan.proto='dhcp'
+delete network.lan.ipaddr
+delete network.lan.netmask
+delete network.lan.ip6assign
+delete network.wan
+delete network.wan6
+set dhcp.lan.ignore='1'
+set system.ntp.enabled='0'
+commit
+EOF
+for s in dnsmasq odhcpd firewall dropbear uhttpd sysntpd; do
+    [ -x /etc/init.d/$s ] && /etc/init.d/$s disable
+done
+exit 0

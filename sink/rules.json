@@ -1,0 +1,37 @@
+{
+  "_comment": "First matching rule wins. match keys: proto (http|raw), dst (original IPv4), port, host (regex on Host header), path (regex; named groups usable in respond.file). respond for http: status, body, file (relative to /srv/sandbox/serve), type, headers. respond for raw: action (hold|close), timeout, banner, send_hex.",
+  "rules": [
+    {
+      "name": "example dropper host: serve staged files for any path",
+      "match": {"proto": "http", "dst": "198.51.100.7", "path": "^/(?P<f>[A-Za-z0-9_][A-Za-z0-9_./-]*)$"},
+      "respond": {"file": "example/{f}", "type": "application/octet-stream"}
+    },
+    {
+      "name": "example C2-style port: hold and log (never sends commands)",
+      "match": {"proto": "raw", "port": 4444},
+      "respond": {"action": "hold", "timeout": 600}
+    },
+    {
+      "name": "connectivity checks",
+      "match": {"proto": "http", "path": "^/(generate_204|gen_204)$"},
+      "respond": {"status": 204, "body": ""}
+    },
+    {
+      "name": "public IP lookups",
+      "match": {"proto": "http", "host": "(api\\d*\\.)?ipify\\.org|ifconfig\\.me|icanhazip\\.com|checkip\\..*"},
+      "respond": {"status": 200, "body": "203.0.113.45\n", "type": "text/plain"}
+    },
+    {
+      "name": "ftp banner",
+      "match": {"proto": "raw", "port": 21},
+      "respond": {"banner": "220 FTP server ready\\r\\n", "action": "hold", "timeout": 60}
+    }
+  ],
+  "dns": {
+    "_comment": "names: regex -> IPv4 for A queries (first match wins); default: everything else. Pointing a name at a specific address lets IP-based rules above match it.",
+    "names": {},
+    "default": "10.200.0.1"
+  },
+  "default_http": {"status": 200, "body": "<html><body>It works!</body></html>\n", "type": "text/html"},
+  "default_raw": {"action": "hold", "timeout": 120}
+}

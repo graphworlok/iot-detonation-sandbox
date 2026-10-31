@@ -1,0 +1,13 @@
+[Unit]
+Description=Sandbox network (sbx0 bridge, sbxsink namespace, no uplink)
+After=network-pre.target nftables.service
+Before=sbx-dnsmasq.service sbx-sink.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/sbx/host/sbx-net.sh up
+ExecStop=/opt/sbx/host/sbx-net.sh down
+
+[Install]
+WantedBy=multi-user.target
