@@ -50,6 +50,10 @@ KEY = os.environ.get("SBX_KEY", "/etc/sbx/sink.key")
 SO_ORIGINAL_DST = 80
 MAX_CAPTURE = 1 << 20          # per connection, client->sink bytes kept
 FIRST_WAIT = 5.0               # seconds to wait for the client to speak
+# sends get their own, long timeout: an emulated guest under load can read
+# a large download slowly, and the short receive timeouts would otherwise
+# abort sendall() mid-body
+SEND_TIMEOUT = 120.0
 HTTP_METHODS = (b"GET ", b"POST ", b"HEAD ", b"PUT ", b"OPTIONS ", b"DELETE ",
                 b"CONNECT ", b"PATCH ")
 
@@ -129,6 +133,11 @@ def recv_some(conn, n, timeout):
         return conn.recv(n)
     except (socket.timeout, ssl.SSLError, OSError):
         return b""
+
+
+def send(conn, data):
+    conn.settimeout(SEND_TIMEOUT)
+    conn.sendall(data)
 
 
 def read_http(conn, first):
@@ -230,7 +239,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
                 r, _ = match_rule("raw", dst, port)
                 banner = ((r or {}).get("respond") or {}).get("banner")
                 if banner:
-                    conn.sendall(banner.encode("latin-1").decode("unicode_escape").encode("latin-1"))
+                    send(conn, banner.encode("latin-1").decode("unicode_escape").encode("latin-1"))
                     ev["sent_banner"] = (r or {}).get("name")
                     first = recv_some(conn, 65536, 30)
             if first[:1] == b"\x16" and os.path.exists(CERT):
@@ -245,12 +254,14 @@ class TCPHandler(socketserver.BaseRequestHandler):
             if first.startswith(HTTP_METHODS):
                 method, path, version, hdrs, body, head = read_http(conn, first)
                 resp, rule = answer_http(dst, port, method, path, hdrs)
-                conn.sendall(resp)
+                # record the request before sending, so a failed send still
+                # shows what was asked for
                 ev.update({"kind": "http", "method": method, "path": path,
                            "host": hdrs.get("host"), "ua": hdrs.get("user-agent"),
                            "head": head[:4096], "body_len": len(body),
                            "body_sha256": keep_blob(body), "rule": rule,
                            "resp_len": len(resp)})
+                send(conn, resp)
             elif looks_like_dns_tcp(first):
                 ev["kind"] = "dns"
                 ev["queries"] = self.dns_tcp(conn, first, src, f"{dst}:{port}", ev.get("tls"))
@@ -263,7 +274,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
                     log({"proto": "tcp", "event": "data", "src": src, "dst": f"{dst}:{port}",
                          "rule": ev["rule"], "head_hex": first[:256].hex()})
                 if "send_hex" in resp:
-                    conn.sendall(bytes.fromhex(resp["send_hex"]))
+                    send(conn, bytes.fromhex(resp["send_hex"]))
                 if resp.get("action", "hold") == "hold":
                     deadline = t0 + resp.get("timeout", 120)
                     while len(data) < MAX_CAPTURE and time.time() < deadline:
@@ -297,7 +308,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
                 r = dns_reply(q)
                 if not r:
                     return n
-                conn.sendall(struct.pack("!H", len(r[0])) + r[0])
+                send(conn, struct.pack("!H", len(r[0])) + r[0])
                 log({"proto": "dns", "transport": "tls" if tls else "tcp",
                      "src": src, "dst": dst, **r[1]})
                 n += 1
