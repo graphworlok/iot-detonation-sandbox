@@ -18,6 +18,13 @@ kernels ship without kallsyms):
    comm "ash") call kill(own pid, 0), and the tracer searches that task_struct
    for the PID pair and the name.
 
+With --trace-write (cfg "trace_write") it also follows file changes: opens
+with write flags (their fd is remembered per process), write/writev/pwrite64
+to those fds with the first bytes written, close, dup2/dup3, chmod, mkdir,
+rmdir, link/symlink, renameat and truncate. The open/openat breakpoints are
+then needed anyway, but only write opens are logged unless --trace-open is
+also set.
+
 Implemented for MIPS o32 (big- and little-endian). Other ABIs need their own
 syscall numbers, argument registers and "current task" expression.
 
@@ -42,14 +49,30 @@ O32 = {
     "sendto": 4180, "socket": 4183, "prctl": 4192, "vfork": 4190,
     "exit_group": 4246, "unlinkat": 4294, "ptrace": 4026,
     "open": 4005, "openat": 4288,
+    # --trace-write
+    "write": 4004, "close": 4006, "creat": 4008, "link": 4009, "chmod": 4015,
+    "mkdir": 4039, "rmdir": 4040, "dup2": 4063, "symlink": 4083,
+    "truncate": 4092, "ftruncate": 4093, "fchmod": 4094, "writev": 4146,
+    "pwrite64": 4201, "mkdirat": 4289, "renameat": 4295, "linkat": 4296,
+    "symlinkat": 4297, "fchmodat": 4299, "dup3": 4327, "renameat2": 4351,
 }
 NI_SLOTS = [17, 31, 32, 35, 44, 53, 56, 58]  # break stty gtty ftime prof lock mpx ulimit
 TRACE = ["exit", "fork", "unlink", "execve", "chdir", "kill", "rename", "setsid",
          "reboot", "clone", "connect", "bind", "listen", "sendto", "socket",
          "prctl", "vfork", "exit_group", "unlinkat", "ptrace"]
-if CFG.get("trace_open"):
+if CFG.get("trace_open") or CFG.get("trace_write"):
     TRACE += ["open", "openat"]
+if CFG.get("trace_write"):
+    TRACE += ["write", "close", "creat", "link", "chmod", "mkdir", "rmdir",
+              "dup2", "symlink", "truncate", "ftruncate", "fchmod", "writev",
+              "pwrite64", "mkdirat", "renameat", "linkat", "symlinkat",
+              "fchmodat", "dup3", "renameat2"]
 RETURN_FOR = {"fork", "clone", "vfork", "connect", "bind", "socket"}
+# MIPS open flags (not the generic values): O_WRONLY 1, O_RDWR 2,
+# O_APPEND 0x8, O_CREAT 0x100, O_TRUNC 0x200
+O_WRITE = 0x3 | 0x8 | 0x100 | 0x200
+HEAD = 96   # bytes of each write kept in the event
+WRITES_SHOWN = 4    # writes logged per open file; the rest are counted
 
 out = open(CFG["out"], "a", buffering=1)
 status = open(CFG["status"], "a", buffering=1)
@@ -58,6 +81,12 @@ offsets = {}
 # mode), so stop() handlers that need that queue the change here and return
 # True; the main loop applies it with the guest halted and continues.
 pending = []
+# --trace-write: files opened for writing, {(tgid, fd): {path, n, bytes}}
+# (writes so far). Filled on the
+# open return path, copied to children on fork, dropped on close (or when a
+# socket reuses the number). Writes to other fds (console, pipes, sockets:
+# the sink sees those) are not logged.
+wfds = {}
 
 
 def say(msg):
@@ -95,6 +124,32 @@ def cstr(addr, n=256):
         if b is None:
             return "<unreadable>"
     return b.split(b"\0")[0].decode("latin-1")
+
+
+def shown(b):
+    """Bytes for an event: text if printable, else hex."""
+    t = b.decode("latin-1")
+    if all(c.isprintable() or c in "\t\r\n" for c in t):
+        return {"head": t}
+    return {"head_hex": b.hex()}
+
+
+def head(addr, n):
+    b = mem(addr, min(n, HEAD)) if addr and n else None
+    return shown(b) if b else {}
+
+
+def iov_head(addr, cnt):
+    """Total length and first bytes of a writev iovec array."""
+    data, total = b"", 0
+    for i in range(min(cnt, 16)):
+        base, ln = u32(addr + 8 * i), u32(addr + 8 * i + 4)
+        if base is None or ln is None:
+            break
+        total += ln
+        if len(data) < HEAD and ln:
+            data += mem(base, min(ln, HEAD - len(data))) or b""
+    return total, shown(data)
 
 
 def sockaddr(addr, ln):
@@ -156,14 +211,19 @@ class ReturnBP(gdb.Breakpoint):
     The return address is shared by every syscall, so hits from other tasks
     (different thread_info in $gp) are ignored."""
 
-    def __init__(self, addr, gp, ev):
+    def __init__(self, addr, gp, ev, on_ret=None, refetch=None):
         super().__init__("*0x%x" % addr, internal=True, temporary=False)
         self.gp, self.ev, self.done = gp, ev, False
+        self.on_ret, self.refetch = on_ret, refetch
 
     def stop(self):
         if self.done or reg("gp") != self.gp:
             return False
         self.done = True
+        if self.refetch:
+            # a user string in a page that was not mapped at entry is
+            # readable now that the kernel has faulted it in
+            self.ev.update(self.refetch())
         # right after the handler returns, v0 is the raw kernel result:
         # -errno for failures (handle_sys converts it to a3/errno later)
         v0 = reg("v0")
@@ -171,6 +231,8 @@ class ReturnBP(gdb.Breakpoint):
             self.ev["errno"] = 0x100000000 - v0
         else:
             self.ev["ret"] = v0
+            if self.on_ret:
+                self.on_ret(v0, self.ev)
         emit(self.ev)
         pending.append(self.delete)
         return True
@@ -195,12 +257,73 @@ class SyscallBP(gdb.Breakpoint):
                     break
                 argv.append(cstr(p, 128))
             ev["argv"] = argv
-        elif n in ("unlink", "chdir", "open"):
+        elif n in ("unlink", "chdir", "rmdir"):
             ev["path"] = cstr(a[0])
-        elif n in ("unlinkat", "openat"):
+        elif n == "unlinkat":
             ev["path"] = cstr(a[1])
-        elif n == "rename":
+        elif n in ("open", "openat", "creat"):
+            pa = a[1] if n == "openat" else a[0]
+            # creat = open(O_CREAT|O_TRUNC|O_WRONLY)
+            flags = a[2] if n == "openat" else a[1] if n == "open" else 0x301
+            ev["path"], ev["flags"] = cstr(pa), hex(flags)
+            refetch = (lambda: {"path": cstr(pa)}) if ev["path"] == "<unreadable>" else None
+            if flags & O_WRITE and CFG.get("trace_write"):
+                tgid = ev.get("tgid")
+
+                def opened(fd, ret):
+                    wfds[(tgid, fd)] = {"path": ret.get("path"), "n": 0, "bytes": 0}
+                return self.on_return(ev, opened, refetch)
+            if not CFG.get("trace_open"):
+                return False
+            if refetch:
+                return self.on_return(ev, None, refetch)
+        elif n in ("write", "pwrite64", "writev"):
+            f = wfds.get((ev.get("tgid"), a[0]))
+            if f is None:
+                return False
+            if n == "writev":
+                ln, h = iov_head(a[1], a[2]) if f["n"] < WRITES_SHOWN else (
+                    sum(u32(a[1] + 8 * i + 4) or 0 for i in range(min(a[2], 16))), {})
+            else:
+                ln, h = a[2], head(a[1], a[2]) if f["n"] < WRITES_SHOWN else {}
+            f["n"] += 1
+            f["bytes"] += ln
+            if f["n"] > WRITES_SHOWN:
+                return False    # counted; the close event has the totals
+            ev["fd"], ev["path"], ev["len"] = a[0], f["path"], ln
+            ev.update(h)
+        elif n == "close":
+            f = wfds.pop((ev.get("tgid"), a[0]), None)
+            if f is None:
+                return False
+            ev["fd"], ev["path"], ev["writes"], ev["bytes"] = a[0], f["path"], f["n"], f["bytes"]
+        elif n in ("dup2", "dup3"):
+            tgid = ev.get("tgid")
+            wfds.pop((tgid, a[1]), None)
+            f = wfds.get((tgid, a[0]))
+            if f is None:
+                return False
+            wfds[(tgid, a[1])] = {"path": f["path"], "n": 0, "bytes": 0}
+            ev["fd"], ev["newfd"], ev["path"] = a[0], a[1], f["path"]
+        elif n in ("ftruncate", "fchmod"):
+            f = wfds.get((ev.get("tgid"), a[0])) or {}
+            ev["fd"], ev["path"] = a[0], f.get("path")
+            if n == "ftruncate":
+                ev["length"] = a[1]
+            else:
+                ev["mode"] = oct(a[1])
+        elif n == "truncate":
+            ev["path"], ev["length"] = cstr(a[0]), a[1]
+        elif n in ("chmod", "mkdir"):
+            ev["path"], ev["mode"] = cstr(a[0]), oct(a[1])
+        elif n in ("fchmodat", "mkdirat"):
+            ev["path"], ev["mode"] = cstr(a[1]), oct(a[2])
+        elif n in ("rename", "link", "symlink"):
             ev["from"], ev["to"] = cstr(a[0]), cstr(a[1])
+        elif n in ("renameat", "renameat2", "linkat"):
+            ev["from"], ev["to"] = cstr(a[1]), cstr(a[3])
+        elif n == "symlinkat":
+            ev["from"], ev["to"] = cstr(a[0]), cstr(a[2])
         elif n == "kill":
             ev["target_pid"] = a[0] - (1 << 32) if a[0] & 0x80000000 else a[0]
             ev["sig"] = a[1]
@@ -210,6 +333,8 @@ class SyscallBP(gdb.Breakpoint):
                 ev["name"] = cstr(a[1], 16)
         elif n in ("connect", "bind"):
             ev["fd"], ev["addr"] = a[0], sockaddr(a[1], a[2])
+            if ev["addr"] is None and a[1]:
+                return self.on_return(ev, None, lambda: {"addr": sockaddr(a[1], a[2])})
         elif n == "socket":
             ev["domain"], ev["type"], ev["proto"] = a[0], a[1], a[2]
         elif n == "sendto":
@@ -220,17 +345,33 @@ class SyscallBP(gdb.Breakpoint):
             ev["cmd"] = hex(a[2])
         else:
             ev["args"] = [hex(x) for x in a]
-        emit(ev)
+        if n in ("fork", "vfork", "clone") and wfds:
+            # the child inherits the parent's open files
+            mine = {fd: f["path"] for (k, fd), f in wfds.items() if k == ev.get("tgid")}
+
+            def child(pid, ret):
+                for fd, p in mine.items():
+                    wfds[(pid, fd)] = {"path": p, "n": 0, "bytes": 0}
+            return self.on_return(ev, child)
+        if n == "socket" and wfds:
+            # a new socket may reuse the number of a closed file
+            tgid = ev.get("tgid")
+            return self.on_return(ev, lambda fd, ret: wfds.pop((tgid, fd), None))
         if n in RETURN_FOR:
-            # the result (child PID, connect status, socket fd) arrives on
-            # the return path; the entry event is logged first in case the
-            # task dies before returning
-            gp, ra = reg("gp"), reg("ra")
-            ret = {k: ev[k] for k in ("sys", "pid", "tgid", "comm") if k in ev}
-            ret["phase"] = "return"
-            pending.append(lambda: ReturnBP(ra, gp, ret))
-            return True
+            return self.on_return(ev)
+        emit(ev)
         return False
+
+    def on_return(self, ev, on_ret=None, refetch=None):
+        """Log the entry event, then catch the result (child PID, connect
+        status, fd) on the return path. The entry is logged first in case the
+        task dies before returning."""
+        emit(ev)
+        gp, ra = reg("gp"), reg("ra")
+        ret = {k: ev[k] for k in ("sys", "pid", "tgid", "comm", "path") if k in ev}
+        ret["phase"] = "return"
+        pending.append(lambda: ReturnBP(ra, gp, ret, on_ret, refetch))
+        return True
 
 
 class CalibrateBP(gdb.Breakpoint):

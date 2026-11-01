@@ -13,7 +13,8 @@ For each target in targets.json (default: all):
        /usr/libexec/sbx/bin/sleep    hard link to it
        /usr/libexec/sbx/mon.sh       guest-side process monitor
   4. write /srv/sandbox/images/<target>/{kernel,rootfs.ext4,manifest.json}.
-Guests boot the rootfs with snapshot=on, so the image is never modified.
+Guests boot the rootfs through a per-run qcow2 overlay, so the image is never
+modified.
 Re-running is safe: downloads are cached in /srv/sandbox/images/cache.
 """
 import gzip

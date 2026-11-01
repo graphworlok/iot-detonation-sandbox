@@ -35,7 +35,7 @@ install -m 0644 "$SRC/guests/targets.json" /opt/sbx/guests/
 rm -rf /opt/sbx/guests/overlay
 cp -r "$SRC/guests/overlay" /opt/sbx/guests/overlay
 install -m 0755 "$SRC/run/sbx-run.py" /opt/sbx/run/
-install -m 0644 "$SRC/run/sbx-trace.py" /opt/sbx/run/
+install -m 0644 "$SRC/run/sbx-trace.py" "$SRC/run/sbx-fsdiff.py" /opt/sbx/run/
 ln -sf /opt/sbx/run/sbx-run.py /usr/local/sbin/sbx-run
 
 # config: rules.json is only seeded; local edits survive re-installs
