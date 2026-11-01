@@ -46,12 +46,17 @@ MACs or 10.200.0.0/24), see [Verification](#verification).
   DNS over TCP is answered on any port, and DNS over TLS too (a sample with
   its own resolver list may use :853).
   `rules.json` `dns.names` can map a name to another address, e.g. to make a
-  domain look like a known C2 IP so IP-based rules match.
+  domain look like a known C2 IP so IP-based rules match; `dns.nx` lists
+  name patterns that get NXDOMAIN, e.g. to push a sample onto a fallback
+  lookup path.
 - **TCP:** the original destination is recovered with `SO_ORIGINAL_DST`.
   TLS is terminated with a self-signed certificate (so `curl -k` /
   `wget --no-check-certificate` work; the SNI is logged). HTTP is parsed and
   answered from rules: serve a file from `/srv/sandbox/serve`, a fixed body,
-  or a status. Other protocols: hold the connection and record what the
+  or a status. Rules can also match the request body (`match.body`, a
+  regex), and named groups from `path` or `body` fill `{name}` placeholders
+  in a reply body, e.g. to echo a JSON-RPC `id` when standing in for a
+  public lookup service. Other protocols: hold the connection and record what the
   client sends, optionally send a banner or fixed bytes first.
 - **UDP:** summarised per source per minute (flood-safe); the pcap has the
   datagrams.

@@ -1,5 +1,5 @@
 {
-  "_comment": "First matching rule wins. match keys: proto (http|raw), dst (original IPv4), port, host (regex on Host header), path (regex; named groups usable in respond.file). respond for http: status, body, file (relative to /srv/sandbox/serve), type, headers. respond for raw: action (hold|close), timeout, banner, send_hex.",
+  "_comment": "First matching rule wins. match keys: proto (http|raw), dst (original IPv4), port, host (regex on Host header), path (regex; named groups usable in respond.file and respond.body), body (http only: regex searched in the request body, case-insensitive; named groups usable likewise). respond for http: status, body ({name} placeholders take the named groups), file (relative to /srv/sandbox/serve), type, headers. respond for raw: action (hold|close), timeout, banner, send_hex.",
   "rules": [
     {
       "name": "example dropper host: serve staged files for any path",
@@ -28,7 +28,7 @@
     }
   ],
   "dns": {
-    "_comment": "names: regex -> IPv4 for A queries (first match wins); default: everything else. Pointing a name at a specific address lets IP-based rules above match it.",
+    "_comment": "names: regex -> IPv4 for A queries (first match wins); nx: list of name regexes answered NXDOMAIN (checked first, any query type); default: everything else. Pointing a name at a specific address lets IP-based rules above match it.",
     "names": {},
     "default": "10.200.0.1"
   },

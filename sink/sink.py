@@ -99,7 +99,7 @@ def original_dst(sock):
     return socket.inet_ntoa(raw[4:8]), port
 
 
-def match_rule(proto, dst, port, host=None, path=None):
+def match_rule(proto, dst, port, host=None, path=None, body=None):
     for r in rules().get("rules", []):
         m = r.get("match", {})
         if m.get("proto", proto) != proto:
@@ -116,6 +116,13 @@ def match_rule(proto, dst, port, host=None, path=None):
             if not mm:
                 continue
             groups = mm.groupdict()
+        if "body" in m:
+            # request body (HTTP), searched case-insensitively; named groups
+            # join the path groups for use in the response
+            mm = re.search(m["body"], (body or b"").decode("latin-1"), re.I | re.S)
+            if not mm:
+                continue
+            groups.update(mm.groupdict())
         return r, groups
     return None, {}
 
@@ -175,7 +182,7 @@ def http_response(status, body, ctype="text/html", extra=None):
     return ("\r\n".join(h) + "\r\n\r\n").encode() + body
 
 
-def answer_http(dst, port, method, path, hdrs):
+def answer_http(dst, port, method, path, hdrs, req_body=b""):
     host = hdrs.get("host", "").split(":")[0]
     if dst == SINK_IP and path.startswith("/_sbx/"):
         p = safe_join(SERVE_DIR, path[len("/_sbx/"):])
@@ -183,7 +190,7 @@ def answer_http(dst, port, method, path, hdrs):
             with open(p, "rb") as f:
                 return http_response(200, f.read(), "application/octet-stream"), "serve"
         return http_response(404, b"not found\n", "text/plain"), "serve-miss"
-    r, groups = match_rule("http", dst, port, host, path)
+    r, groups = match_rule("http", dst, port, host, path, req_body)
     resp = (r or {}).get("respond") or rules().get("default_http") or {}
     name = (r or {}).get("name", "default_http")
     status = resp.get("status", 200)
@@ -196,7 +203,12 @@ def answer_http(dst, port, method, path, hdrs):
         else:
             status, body, ctype = 404, b"not found\n", "text/plain"
     else:
-        body = resp.get("body", "").encode()
+        text = resp.get("body", "")
+        # "{name}" placeholders take path/body regex groups (plain replace, so
+        # JSON braces in the body need no escaping)
+        for k, v in groups.items():
+            text = text.replace("{%s}" % k, v or "")
+        body = text.encode()
     return http_response(status, body if method != "HEAD" else b"", ctype,
                          resp.get("headers")), name
 
@@ -253,7 +265,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
                 first = recv_some(conn, 65536, FIRST_WAIT)
             if first.startswith(HTTP_METHODS):
                 method, path, version, hdrs, body, head = read_http(conn, first)
-                resp, rule = answer_http(dst, port, method, path, hdrs)
+                resp, rule = answer_http(dst, port, method, path, hdrs, body)
                 # record the request before sending, so a failed send still
                 # shows what was asked for
                 ev.update({"kind": "http", "method": method, "path": path,
@@ -409,10 +421,14 @@ def dns_reply(q):
     name = ".".join(labels)
     ans = b""
     ip = None
-    if qtype == 1 and qclass == 1:
+    rcode = 0
+    if any(re.fullmatch(p, name, re.I) for p in rules().get("dns", {}).get("nx", [])):
+        rcode = 3                       # NXDOMAIN, e.g. to force a fallback path
+        ip = "NXDOMAIN"
+    elif qtype == 1 and qclass == 1:
         ip = dns_answer_for(name)
         ans = struct.pack("!HHHIH", 0xC00C, 1, 1, 60, 4) + socket.inet_aton(ip)
-    rflags = 0x8180 | (flags & 0x0100)
+    rflags = 0x8180 | (flags & 0x0100) | rcode
     hdr = struct.pack("!HHHHHH", qid, rflags, 1, 1 if ans else 0, 0, 0)
     return hdr + question + ans, {"qname": name, "qtype": DNS_QTYPES.get(qtype, qtype),
                                   "answer": ip}
