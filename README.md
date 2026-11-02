@@ -59,7 +59,10 @@ MACs or 10.200.0.0/24), see [Verification](#verification).
   public lookup service. Other protocols: hold the connection and record what the
   client sends, optionally send a banner or fixed bytes first.
 - **UDP:** summarised per source per minute (flood-safe); the pcap has the
-  datagrams.
+  datagrams. STUN Binding Requests (RFC 5389, to any address and port) get
+  a binding response carrying the guest's own address, as a public STUN
+  server would, so samples that wait for one move on; `rules.json`
+  `"stun": false` turns this off. Nothing else over UDP is answered.
 - **Samples to guests:** `GET http://10.200.0.1/_sbx/<path>` serves
   `/srv/sandbox/serve/<path>`.
 - **Log:** `/var/lib/sbx/sink/events.jsonl` (one JSON object per DNS query,

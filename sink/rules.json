@@ -32,6 +32,8 @@
     "names": {},
     "default": "10.200.0.1"
   },
+  "_stun_comment": "stun: answer STUN Binding Requests on any UDP address/port with the client's address (default true).",
+  "stun": true,
   "default_http": {"status": 200, "body": "<html><body>It works!</body></html>\n", "type": "text/html"},
   "default_raw": {"action": "hold", "timeout": 120}
 }

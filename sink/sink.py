@@ -18,6 +18,8 @@ Runs inside the sbxsink namespace (sbx-sink.service), stdlib only.
   is recognised by the catch-all and answered the same way.
 - UDP logger on :9998 (summarised per source, flood-safe). The original UDP
   destination is not recoverable after DNAT; the host-side pcap has it.
+  STUN Binding Requests are answered with the client's address, so clients
+  that wait for a STUN server get one (rules.json "stun": false disables).
 - GET /_sbx/<path> to the sink address serves files from SERVE_DIR: this is
   how guests are handed samples.
 
@@ -362,8 +364,29 @@ class _Replay:
         return b
 
 
+STUN_MAGIC = 0x2112A442
+
+
+def stun_reply(d, addr):
+    """Binding success response (RFC 5389) to a STUN Binding Request `d` from
+    `addr`, or None if `d` is not one. Reports the address the sink sees, as a
+    public STUN server would (XOR-MAPPED-ADDRESS, plus MAPPED-ADDRESS for
+    older clients). Only the binding method is answered."""
+    if len(d) < 20:
+        return None
+    mtype, mlen, magic = struct.unpack("!HHI", d[:8])
+    if mtype != 0x0001 or magic != STUN_MAGIC or mlen != len(d) - 20 or mlen % 4:
+        return None
+    ip, port = socket.inet_aton(addr[0]), addr[1]
+    xip = bytes(a ^ b for a, b in zip(ip, struct.pack("!I", STUN_MAGIC)))
+    attrs = (struct.pack("!HHBBH", 0x0020, 8, 0, 1, port ^ (STUN_MAGIC >> 16)) + xip
+             + struct.pack("!HHBBH", 0x0001, 8, 0, 1, port) + ip)
+    return struct.pack("!HHI", 0x0101, len(attrs), STUN_MAGIC) + d[8:20] + attrs
+
+
 class UDPLogger(threading.Thread):
-    """Count datagrams per source; log one summary line per source per minute."""
+    """Count datagrams per source; log one summary line per source per minute.
+    STUN Binding Requests are answered (rules.json "stun": false turns it off)."""
 
     def __init__(self):
         super().__init__(daemon=True)
@@ -380,12 +403,19 @@ class UDPLogger(threading.Thread):
                 st = self.stats.setdefault(a[0], {"n": 0, "bytes": 0, "first_hex": d[:128].hex()})
                 st["n"] += 1
                 st["bytes"] += len(d)
+                r = stun_reply(d, a) if rules().get("stun", True) else None
+                if r:
+                    self.s.sendto(r, a)
+                    st["stun"] = st.get("stun", 0) + 1
             except socket.timeout:
                 pass
             if time.time() - last >= 60 and self.stats:
                 for ip, st in self.stats.items():
-                    log({"proto": "udp", "src": ip, "datagrams": st["n"],
-                         "bytes": st["bytes"], "first_hex": st["first_hex"]})
+                    ev = {"proto": "udp", "src": ip, "datagrams": st["n"],
+                          "bytes": st["bytes"], "first_hex": st["first_hex"]}
+                    if st.get("stun"):
+                        ev["stun_answered"] = st["stun"]
+                    log(ev)
                 self.stats, last = {}, time.time()
 
 
